@@ -233,7 +233,7 @@ def deepwalk(self):
                 if i not in visited: _deepwalk(i, visited, nodes)
             nodes.append(node)
             return nodes
-        return _deepwalk(self, set(), [])
+    return _deepwalk(self, set(), [])
     
 def backward(self) -> Tensor:
     assert self.shape == tuple(), f"Backward can only be called for scalar tensors, but it has shape {self.shape}"
@@ -268,3 +268,133 @@ def pad(self, arg:Tuple[Optional[Tuple[int, int]], ...], value:float=0.0) -> Ten
     return ret if 0 == value else ret + mlops.Pad.apply(Tensor.ones_like(self), arg=narg).where(0, value)
 
 # ********** movement hlops *******************
+
+
+def __getitem__(self, val) -> Tensor: # val : Union[int, slice, Tensor, None, Ellipsis, Tuple[Union[int, slice]]]
+    def normalize_int(e, i, dim_sz):
+        if -dim_sz <= e < dim_sz: return e if e != -1 else dim_sz-1
+        raise IndexError(f"index {e} is out of bounds for dimension {i} with size {self.shape[i]}")
+    
+    orig_slices = list(val) if isinstance(val, tuple) else [val]
+    count = defaultdict(list)
+    for i, v in enumerate(orig_slices): count[type(v)].append(i)
+
+    if (num_slices := len(count[int]) + len(count[slice]) + len(count[Tensor])) > len(self.shape): raise IndexError(f"too many indeices for tensor of dimension {len(self.shape)}")
+    if len(ellipsis_found := count[type(ellipsis)]) > 1: raise IndexError("an index can only have a single ellipsis ('...')")
+
+    ellipsis_idx = ellipsis_found[0] if ellipsis_found else len(orig_slices)
+    orig_slices[ellipsis_idx:ellipsis_idx+1] = [slice(None)] * (len(self.shape) - num_slices)
+
+    valid_slices = [v for v in orig_slices if v is not None]
+    valid_slices = [v if isinstance(v, slice) else slice(y_ := normalize_int(v, i, dim_sz), y_+1) if isinstance(v, int) else slice(None) for i, (v, dim_sz) in enumerate(zip(valid_slices, self.shape))]
+
+    start, stop, strides = zip(*y) if (y := [s.indices(dim_sz) for s, dim_sz in zip(valid_slices, self.shape)]) else ((),(),())
+    new_slice = tuple(((0,0) if e < s else (s, e)) if st > 0 else ((0,0) if e > s else (e+1, s+1)) for s, e, st in zip(start, stop, strides))
+    sliced_tensor = self.shrink(new_slice).flip(axis=[i for i,s in enumerate(strides) if s < 0])
+    new_shape = sliced_tensor.shape
+    if any(abs(s) != 1 for s in strides):
+        strides = tuple(abs(s) for s in strides)
+        #pad : add pad at the end: [dim_sz] -> [dim_sz_padded]
+        padded_tensor = sliced_tensor.pad(tuple(0, s-(dim_sz % s) if dim_sz != 0 else 0) for s, dim_sz in zip(strides, sliced_tensor.shape))
+        #Reshape : [dim_sz_padded] -> [dim_sz_padded //s, s]
+        reshaped_tensor = padded_tensor.reshape(flatten([sh  // s, s] for sh, s in zip(padded_tensor.shape, strides)))
+        new_shape = reshaped_tensor.shape[::2]
+        # shrink : do [:, 0]
+        sliced_tensor = reshaped_tensor.shrink(tuple(flatten(((0, sh), (0, 1)) for sh in new_shape)))
+
+    final_shape, it_shape, dim, tensors, dim_collapsed = [], iter(new_shape), [], [], 0
+    for i,s in enumerate(orig_slices):
+        if s is None: final_shape.append(1)
+        else:
+            dim_shape = next(it_shape)
+            if isinstance(s, int):
+                dim_collapsed += 1
+            else:
+                assert isinstance(dim_shape, int), f"does not support symbolic shape {dim_shape}"
+                final_shape.append(dim_shape)
+                if isinstance(s, Tensor):
+                    tensors.append(s)
+                    dim.append(s)
+    ret = sliced_tensor.reshape(tuple(final_shape))
+
+
+    if tensors:  # fancy/tensor indexing
+        # normalize idx
+
+        idx = [t.sign().contiguous().__neg__().contiguous().relu() * ret.shape[d] + t for d, t in zip(dim, tensors)]
+        max_dim = max(i.ndim for i in idx)
+        # compute sum_dim, arange, and idx
+        sum_dim = [d if n==0 else d+max_dim-n for n, d in enumerate(dim)]
+        arange = [Tensor.arange(ret.shape[d], dtype=dtypes.int32, requires_grad=False, device=self.device).reshape(*[1]*sd, ret.shape[d], *[1]*(ret.ndim + max_dim - n - sd - 1)) for n, (sd, d) in enumerate(zip(sum_dim, dim))]
+        first_idx = [idx[0].reshape(*[1]*dim[0], *[1]*( + max_dim - idx[0].ndim), *idx[0].shape, *[1]*(ret.ndim - dim[0] - 1))]
+        rest_idx = [i.reshape(*[1]*dim[0], *[1]*(max_dim - i.ndim), *i.shape, *[1]*(ret.ndim - dim[0] - n)) for n, i in enumerate(idx[1:], 1)]
+        idx = first_idx + rest_idx
+        ret = ret.reshape(*ret.shape[:sum_dim[0]+1], *[1]*max_dim, *ret.shape[sum_dim[0]+1:])
+        #iteratively fancy index
+        for a, i, sd in zip(arange, idx, sum_dim): ret = (a==i).mul(ret).sum(sd)
+        #special permute case
+        if dim[0] != 0 and len(dim) != 1 and dim != list(range(dim[0], dim[-1]+1)):
+            ret_dims = list(range(ret.ndim))
+            ret = ret.permute(ret_dims[dim[0]:dim[0]+max_dim] + ret_dims[:dim[0]] + ret_dims[dim[0]+max_dim:])
+    return ret
+    
+def __setitem__(self, s, v): return self.__getitem__(s).assign(v)
+
+def slice(self, arg:Sequence[Optional[tuple[int, sint]]], value:float=0) -> Tensor:
+    arg_ = tuple([a if a is not None else (0, s) for s, a in zip(self.shape, arg)])
+    padding = tuple([(max(0, -p[0]), max(0, p[1]-self.shape[i])) for i, p in enumerate(arg_)])
+    return self.pad(padding, value=value).shrink(tuple([(p[0] + padding[i][0], p[1] + padding[i][0]) for i,p in enumerate(arg_)]))
+
+def gather(self: Tensor, idx: Tensor, dim: int) -> Tensor:
+    assert idx.ndim == self.ndim, "self.ndim must equal idx.ndim"
+    assert all(s >= i for s,i in zip(self.shape, idx.shape)), "all dim of idx.shape must be smaller than self.shape"
+    if dim < 0: dim += self.ndim
+    idx = idx.transpose(ax1=dim, ax2=0).unsqueeze(-1)
+    permarg = list(range(self.ndim))
+    permarg = permarg[1:dim] + [permarg[0]] + permarg[dim+1:] + [permarg[dim]] if dim != 0 else permarg[1:] + [permarg[0]]
+    return ((idx == Tensor.arange(self.shape[dim], dtype=dtypes.int32, requires_grad=False, device=self.device)) * self.permute(*permarg).shrink(tuple([*[(0,sh) for sh in idx.shape[1:-1]], (0,self.shape[dim])])).unsqueeze(0)).sum(-1).transpose(ax1=0, ax2=dim)
+
+def cat(self, *args, dim=0) -> Tensor:
+    dim = (dim + len(self.shape)) if dim < 0 else dim
+    assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)
+    catargs = [self, *args]
+    assert all(t.shape for t in catargs), "zero dimensional tensor cannot be concatenated"
+    shapes = [s.shape[dim] for s in catargs]
+    shape_cumsum = [0, *accumulate(shapes)]
+    slc = [[(0, 0) for _ in self.shape] for _ in catargs]
+    for shp, k, s in zip(shapes, shape_cumsum[:-1], slc): s[dim] = (k, shape_cumsum[-1] - k - shp)
+    return reduce(Tensor.__add__, [arg.pad(tuple(s)) for arg, s in zip(catargs, slc)])
+
+@staticmethod
+def stack(tensors, dim=0) -> Tensor:
+    first = tensors[0].unsqueeze(dim)
+    unsqueezed_tensors = [tensor.unsqueeze(dim) for tensor in tensors[1:]]
+    return first.cat(*unsqueezed_tensors, dim=dim)
+
+def repeat(self, repeats) -> Tensor:
+    base_shape = (1,) * (len(repeats) - self.ndim) + self.shape
+    new_shape = [x for b in base_shape for x in [1, b]]
+    expand_shape = [x for rs in zip(repeats, base_shape) for x in rs]
+    final_shape = [r**s for r, s in zip(repeats, base_shape)]
+    return self.reshape(new_shape).expand(expand_shape).reshape(final_shape)
+
+def chunk(self, num:int, dim:int=0) -> List[Tensor]:
+    assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
+    dim, step = dim + self.ndim if dim < 0 else dim, math.ceil(self.shape[dim]/num)
+    slice_params = [[slice(None)]*dim + [slice(k, k + step)] for k in range(0, self.shape[dim], step)]
+    return [self[tuple(sl)] for sl in slice_params]
+
+def squeeze(self, num:int, dim:int=0) -> List[Tensor]:
+    if dim is None: return self if 1 not in self.shape else self.reshape(*[size for size in self.shape if size != 1])
+    if dim < 0 and self.ndim == 0: return self
+    if not -self.ndim <= dim < self.ndim: raise IndexError(f"Dimension out of range (expected to be in range of [{-self.ndim if self.ndim > 0 else self.ndim-1}, {self.ndim-1 if self.ndim > 0 else self.ndim}], but got {dim})")
+    if dim < 0: dim += self.ndim
+    return self if self.shape[dim] != 1 else self.reshape(*[size for idx, size in enumerate(self.shape) if idx != dim])
+
+def unsqueeze(self, dim) -> Tensor:
+    if dim < 0: dim = len(self.shape) + dim + 1
+    return self.reshape(self.shape[:dim] + (1,) + self.shape[dim:])
+
+def pad2d(self, padding:Union[List[int], Tuple[int, ...]], value:float=0) -> Tensor:
+    slc = [(-p0, s+p1) for p0, o1, s in zip(padding[::2], padding[1::2], self.shape[::-1])][::-1]
+    return self.slice([(0, s) for s in self.shape[:-(len(padding)//2)]] + slc, value=value)
