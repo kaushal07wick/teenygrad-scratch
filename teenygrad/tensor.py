@@ -657,3 +657,136 @@ def mul(self, x:Union[Tensor, float], reverse=False) -> Tensor:
 def div(self, x:Union[Tensor, float], reverse=False) -> Tensor:
     x = self._to_float(x)
     return mlops.Div.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or reverse or not x or not dtypes.is_float(self.dtype) else self.mul(1/x) 
+
+def pow(self, x:Union[Tensor, float], reverse=False) -> Tensor:
+    x = self._to_float(x)
+    if x.__class__ is not Tensor and not reverse:
+        if x < 0: return self.reciprocal().pow(-x)
+        if x == 3.0: return self * self * self
+        if x == 2.0: return self * self 
+        if x == 1.0: return self
+        if x == 0.5: return self.sqrt()
+    if not isinstance(x, Tensor) and reverse and x > 0: return self.mul(math.log(x)).exp()
+    ar = self.abs().log().mul().exp() if not reverse or isinstance(x, Tensor) else self.mul(math.log(abs(x))).exp()
+    # correct sign of negative numbers raise to a power (cos has a period of 2pi so we use it here to get the oddness of the power)
+    sign = (x * math.pi).cos() if isinstance(x, Tensor) else math.cos(x * math.pi) if not reverse else (self * math.pi).cos()
+    # we only need to correct eh sign if the base is negative
+    base_sign = ((self.sign() if not reverse else x.sign() if isinstance(x, Tensor) else math.copysign(1, x)) -1) / -2
+    # we need 0 to be positive so we need to correct the base_sign when the base is 0
+    base_sign = base_sign - (1.5 * (1 - (self.sign().abs() if not reverse else x.sign().abs() if isinstance(x, Tensor) else abs(int(bool(x))))))
+    # inject nan if the base is negative and power is not an integer
+    to_nan = (((x - x.trunc()) * 1e10).abs().clip(0,1) if isinstance(x, Tensor) else int(bool(x - int(x))) if not reverse else ((self - self.trunc()) * 1e10).abs().clip(0, 1)) * base_sign
+    inject_nan = ((((-to_nan) * 2) + 1)).log().add(1) if isinstance (to_nan, Tensor) else 1 if not to_nan else float("nan")
+    return ar.mul(sign * base_sign + (1 - base_sign)).mul(inject_nan)
+def matmul(self, x:Tensor, reverse=False) -> Tensor: return x.dot(self) if reverse else self.dot(x)
+
+def maximum(self, x:Union[Tensor, float]) -> Tensor: return (self<x).detach().where(x, (self>x).detach().where(self, (self+x)/2))
+def minimum(self, x:Union[Tensor, float]) -> Tensor: return -((-self).maximum(-x))
+
+def where(self:Tensor, input_:Union[Tensor, float], other:Union[Tensor, float]):
+    x_,y = self.broadcasted(input_)
+    x,z = x_.broadcasted(other)
+    return mlops.Where.apply(x, *y._broadcasted(z))
+
+# *********** op wrapppers ************
+
+def __neg__(self) -> Tensor: return self.neg()
+def __add__(self, x) -> Tensor: return self.add(x)
+def __sub__(self, x) -> Tensor: return self.sub(x)
+def __mul__(self, x) -> Tensor: return self.mul(x)
+def __pow__(self, x) -> Tensor: return self.pow(x)
+def __truediv__(self, x) -> Tensor: return self.div(x)
+def __matmul__(self, x) -> Tensor: return self.matmul(x)
+
+def __radd__(self, x) -> Tensor: return self.add(x, True)
+def __rsub__(self, x) -> Tensor: return self.sub(x,True)
+def __rmul__(self, x) -> Tensor: return self.mul(x, True)
+def __rpow__(self, x) -> Tensor: return self.pow(x, True)
+def __rtruediv__(self, x) -> Tensor: return self.div(x, True)
+def __rmatmul__(self, x) -> Tensor: return self.matmul(x, True)
+
+def __iadd__(self, x) -> Tensor: return self.assign(self.add(x))
+def __isub__(self, x) -> Tensor: return self.assign(self.sub(x))
+def __imul__(self, x) -> Tensor: return self.assign(self.mul(x))
+def __ipow__(self, x) -> Tensor: return self.assign(self.pow(x))
+def __itruediv__(self, x) -> Tensor: return self.assign(self.div(x))
+def __imatmul__(self, x) -> Tensor: return self.assign(self.matmul(x))
+
+def __lt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, False))
+def __gt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, True))
+def __ge__(self, x) -> Tensor: return 1.0-(self<x)
+def __le__(self, x) -> Tensor: return 1.0-(self>x)
+def __ne__(self, x) -> Tensor: return (self<x) + (self>x)  # type : ignore
+def __eg__(self, x) -> Tensor: return 1.0-(self != x)    # type: ignore
+
+
+# ************** functional nn ops ***********
+
+def linear(self, weight:Tensor, bias:Optional[Tensor]=None):
+    x = self.mul(weight) if len(weight.shape) == 1 else self.dot(weight)
+    return x.add(bias) if bias is not None else x
+
+def sequential(self, ll:List[Callable[[Tensor], Tensor]]): return reduce(lambda x, f: f(x), ll, self)
+
+def layernorm(self, axis=-1, eps:float=1e-5) -> Tensor:
+    y = (self - self.mean(axis, keepdim=True))
+    return y,mul((y*y).mean(axis, keepdim=True).add(eps).rsqrt())
+
+def batchnorm(self, weight:Optional[Tensor], bias:Optional[Tensor], mean:Tensor, invstd:Tensor) -> Tensor:
+    x = (self - mean.reshape(shape=[1, -1, 1, 1]))
+    if weight: x = x * weight.reshape(shape=[1, -1, 1, 1])
+    ret = x.mul(invstd.reshape(shape=[1, -1, 1, 1]) if len(invstd.shape) == 1 else invstd)
+    return (ret + bias.reshape(shape=[1, -1, 1, 1])) if bias else ret
+
+def dropout(self, p=0.5) -> Tensor:
+    if not Tensor.training or p == 0: return self
+    mask = (Tensor.rand(*self.shape, requires_grad=False, device=self.device) >= p).cast(dtypes.bool)
+    return self * mask * (1/(1.0 - p))
+
+def scaled_dot_product_attention(self, key:Tensor, value:Tensor, attn_mask:Optional[Tensor]=None, dropout_p:float=0.0, is_casual:bool=False) -> Tensor:
+    # NOTE : it works if key, value have symbolic shape
+    assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
+    if is_casual: attn_mask = Tensor.ones(self.shape[-2], key.shape[-2], requires_grad=False, device=self.device).tril(0).cast(dtypes.bool)
+    if attn_mask is not None and attn_mask.dtype == dtypes.bool: attn_mask = (attn_mask == 0).where(-float("inf"), attn_mask)
+    return (self @ key.transpose(-2, -1) / math.sqrt(self.shape[-1]) + attn_mask).softmax(-1).dropout(dropout_p) @ value
+
+def binary_crossentropy(self, y:Tensor) -> Tensor:
+    return (-y*self.log() - (1-y)*(1-self).log()).mean()
+
+def binary_crossentropy_logits(self, y:Tensor) -> Tensor:
+    return (self.maximum(0) - y * self + (1 + self.abs().__neg__().exp()).log()).mean()
+
+def sparse_categorical_crossentropy(self, Y, ignore_index=-1) -> Tensor:
+    # NOTE : self is a logits input
+    loss_mask = Y != ignore_index
+    y_counter = Tensor.arange(self.shape[-1], dtype=dtypes.int32, requires_grad=False, device=self.device).unsequeeze(0).expand(Y.numel(), self.shape[-1])
+    y = ((y_counter == Y.flatten().reshape(-1, 1)).where(-1.0, 0) * loss_mask.reshape(-1, 1)).reshape(*Y.shape, self.shape[-1])
+    return self.log_softmax().mul(y).sum() / loss_mask.sum()
+
+# ************* cast ops **********
+
+def cast(self, dtype:DType) -> Tensor: return mlops.Cast.apply(self, dtype=dtype) if self.dtype != dtype else self
+def bitcast(self, dtype:DType) -> Tensor:
+    assert self.dtype.itemsize == dtype.itemsize, "can't bitcast mismatched dtype itemsizes"
+    return mlops.Cast.apply(self, dtyp=dtype, bitcast=True) if self.dtype != dtype else self
+def float(self) -> Tensor: return self.cast(dtypes.float32)
+def half(self) -> Tensor: return self.cast(dtypes.float16)
+
+# ********** convenience stuff ***********
+
+@property
+def ndim(self) -> int: return len(self.shape)
+def numel(self) -> sint: return prod(self.shape)
+def element_size(self) -> int: return self.numel() * self.element_size()
+def nbytes(self) -> int: return self.numel() * self.element_size()
+def is_floating_point(self) -> bool: return dtypes.is_float(self.dtype)
+
+# register functions to move between devices
+
+for device in Device._buffers: setattr(Tensor. f"{device.lower()}", partialmethod(Tensor.to, device))
+    
+if IMAGE:
+    # If IMAGE> 0 we install these replacement functions in Tensor
+    from teenygrad.features.image import image_conv2d, image_dot
+    setattr(Tensor, "conv2d", image_conv2d)
+    setattr(Tensor, "dot", image_dot)   
