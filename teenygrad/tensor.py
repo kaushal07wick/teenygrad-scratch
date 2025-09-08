@@ -6,7 +6,7 @@ from functools import partialmethod, reduce
 from itertools import accumulate
 import numpy as np
 
-from teenygrad.helpers import ImageDType, argfix, make_pair, get_env, IMAGE, DEBUG, flatten, DType, dtypes, prod,
+from teenygrad.helpers import ImageDType, argfix, make_pair, get_env, IMAGE, DEBUG, flatten, DType, dtypes, prod
 from teenygrad.lazy import LazyBuffer
 from teenygrad.ops import Device, LoadOps
 from teenygrad.shape.symbolic import sint
@@ -484,22 +484,23 @@ def avg_pool2d(self, kernel_size=(2,2), stride=None, dilation=1): return self._p
 def max_pool2d(self, kernel_size=(2,2), stride=None, dilation=1): return self._pool(make_pair(kernel_size), stride if stride is not None else kernel_size, dilation).max(axis=tuple(range(0-len(make_pair(kernel_size)), 0)))
 
 
-def conv_transpose2d(self, weight:Tensor, bias=Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0, output_padding=0) -> Tensor:
+def conv_transpose2d(self, weight:Tensor, bias:Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0, output_padding=0) -> Tensor:
     HW, trailing = weight.shape[2:], list(range(3, len(weight.shape)+1))
+    x, w = self, weight.reshape(groups, weight.shape[0]//groups, weight.shape[1], *weight.shape[2:]).permute(0,2,1,*trailing).flip(trailing)
     stride = make_pair(stride, len(HW))
-    if any(s > 1 for s in stride):
-        x = x.reshape(*x.shape[:2], *flatten((k,1) for k in x.shape[2:]))
-        x = x.pad(((0,0), (0,0), *flatten(((0,0), (0,s-1)) for s in stride)))
-        x = x.reshape(*x.shape[:2], *[k*s for k,s in zip(x.shape[2::2], stride)])
-        x = x.shrink(((0, x.shape[0]), (0, x.shape[1]), *[(0, k-(s-1)) for k,s in zip(x.shape[2:], stride)]))
-    padding = flatten((((k-1)*d-p, (k-1)*d-p+op) for k,d,p,op in reversed(list(zip(HW, make_pair(dilation, len(HW)), make_pair(padding, len(HW)), make_pair(output_padding, len(HW)))))))
-    return x.conv2d(w.reshape(w.shape[0]*w.shape[1], *w.shape[2:]), groups=groups, bias=bias, dilation=dilation, padding=padding)
+    if any(s>1 for s in stride):
+      x = x.reshape(*x.shape[:2], *flatten((k,1) for k in x.shape[2:]))
+      x = x.pad(((0,0), (0,0), *flatten(((0,0),(0,s-1)) for s in stride)))
+      x = x.reshape(*x.shape[:2], *[k*s for k,s in zip(x.shape[2::2], stride)])
+      x = x.shrink(((0,x.shape[0]), (0,x.shape[1]), *[(0,k-(s-1)) for k,s in zip(x.shape[2:], stride)]))
+    padding = flatten((((k-1)*d-p,(k-1)*d-p+op) for k,d,p,op in reversed(list(zip(HW, make_pair(dilation, len(HW)), make_pair(padding, len(HW)), make_pair(output_padding, len(HW)))))))
+    return x.conv2d(w.reshape(w.shape[0]*w.shape[1],*w.shape[2:]), groups=groups, bias=bias, dilation=dilation, padding=padding)
 
 wino = int(getenv("WINO", "0"))
 def conv2d(self, weight:Tensor, bias:Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0) -> Tensor:
     (bs, cin_), (cout, cin), HW = self.shape[:2], weight.shape[:2], weight.shape[2:]
     assert groups*cin == cin_ and len(self.shape) == len(weight.shape), f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups*cin} vs. {cin_})"
-    if isinstance(padding, (tuple, list)): assert len(padding) == 2*len(HW) or len(padding) == len(HW), f"expected padding of length {2*len(HW) or {len(HW}}, but got {len(padding)} for tensor of shape {self.shape}"
+    if isinstance(padding, (tuple,list)): assert len(padding) == 2*len(HW) or len(padding) == len(HW), f"Expected padding of length {2*len(HW)} or {len(HW)}, but got {len(padding)} for tensor of shape {self.shape}"
     padding_ = [padding]*2*len(HW) if isinstance(padding, int) else (padding if len(padding) == 2*len(HW) else [p for p in padding for _ in range(2)][::-1])
 
     # conv2d is a pooling op (with padding)
@@ -783,7 +784,7 @@ def is_floating_point(self) -> bool: return dtypes.is_float(self.dtype)
 
 # register functions to move between devices
 
-for device in Device._buffers: setattr(Tensor. f"{device.lower()}", partialmethod(Tensor.to, device))
+for device in Device._buffers: setattr(Tensor, f"{device.lower()}", partialmethod(Tensor.to, device))
     
 if IMAGE:
     # If IMAGE> 0 we install these replacement functions in Tensor
