@@ -51,6 +51,7 @@ class dtypes:
     uint8: Final[Dtype] = Dtype(2, 1, "unsigned char", np.uint8)
     uint16: Final[Dtype] = Dtype(4, 2,  "unsigned short", np.uint16)
     uint32: Final[Dtype] = Dtype(6, 8, "unsigned long", np.uint64)
+    uint64: Final[Dtype] = Dtype(8, 10, "unsigned long long", np.uint64)
 
     # NOTE: bfloat16 isn't supported in numpy
     bfloat16: Final[Dtype] = Dtype(9, 2, "__bf16", None)
